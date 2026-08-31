@@ -21,7 +21,7 @@ function weekStartOf(dateStr) {
 }
 
 module.exports = async (req, res) => {
-  setCors(res, process.env.ALLOWED_ORIGIN);
+  setCors(res); // '*' — الحماية الحقيقية هي requireAuth() (التوكن)، مش مصدر الطلب
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'method-not-allowed' });
 
