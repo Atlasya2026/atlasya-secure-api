@@ -1,0 +1,139 @@
+// api/answerChallenge.js
+// POST /api/answerChallenge   Body: { questionId, selectedIndex }
+// الإجابة الصحيحة في daily_challenges_answers/{questionId} — collection
+// ممنوع قراءتها من المتصفح خالص (شوف firestore.rules)، فمفيش طريقة الطالب
+// يشوف الإجابة قبل ما يجاوب حتى لو فتح الـ Console.
+
+const { admin, db, requireAuth, setCors } = require('./_firebaseAdmin');
+
+function activeBoostMultiplier(userData) {
+  const b = userData && userData.coinBoost;
+  if (!b || !b.expiresAt) return 1;
+  const exp = b.expiresAt.toDate ? b.expiresAt.toDate() : new Date(b.expiresAt);
+  if (exp <= new Date()) return 1;
+  return b.multiplier || 1;
+}
+
+function weekStartOf(dateStr) {
+  const d = new Date(dateStr + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() - d.getUTCDay());
+  return d.toISOString().slice(0, 10);
+}
+
+module.exports = async (req, res) => {
+  setCors(res); // '*' — الحماية الحقيقية هي requireAuth() (التوكن)، مش مصدر الطلب
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'method-not-allowed' });
+
+  try {
+    const uid = await requireAuth(req);
+    const { questionId, selectedIndex } = req.body || {};
+    if (!questionId || selectedIndex === undefined || selectedIndex === null) {
+      return res.status(400).json({ error: 'بيانات ناقصة' });
+    }
+
+    const questionSnap = await db.collection('daily_challenges').doc(questionId).get();
+    if (!questionSnap.exists) return res.status(404).json({ error: 'السؤال غير موجود' });
+    const question = questionSnap.data();
+
+    const answerSnap = await db.collection('daily_challenges_answers').doc(questionId).get();
+    if (!answerSnap.exists) return res.status(404).json({ error: 'إجابة السؤال غير موجودة' });
+    const answerData = answerSnap.data();
+
+    const attemptRef = db.collection('daily_challenge_attempts').doc(`${uid}_${questionId}`);
+    const userRef = db.collection('users').doc(uid);
+
+    const { correct, coinsAwarded } = await db.runTransaction(async (tx) => {
+      const existing = await tx.get(attemptRef);
+      if (existing.exists) {
+        const err = new Error('اتجاوبت قبل كده');
+        err.status = 409;
+        throw err;
+      }
+      const userSnap = await tx.get(userRef);
+      const userData = userSnap.data() || {};
+
+      const isCorrect = selectedIndex === answerData.correctIndex;
+      const reward = isCorrect ? Math.round((answerData.coins || 0) * activeBoostMultiplier(userData)) : 0;
+
+      tx.set(attemptRef, {
+        userId: uid, questionId, type: question.type,
+        scheduledDate: question.scheduledDate, correct: isCorrect, coinsAwarded: reward,
+        answeredAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      if (reward > 0) {
+        tx.update(userRef, {
+          coins: admin.firestore.FieldValue.increment(reward),
+          coinsEarnedTotal: admin.firestore.FieldValue.increment(reward),
+        });
+        const txRef = db.collection('coin_transactions').doc();
+        const reasonAR = question.type === 'weekly' ? 'إجابة صحيحة في التحدي الأسبوعي' : 'إجابة صحيحة في التحدي اليومي';
+        const reasonEN = question.type === 'weekly' ? 'Correct answer in the weekly challenge' : 'Correct answer in the daily challenge';
+        tx.set(txRef, {
+          userId: uid, type: 'earn', amount: reward, reasonAR, reasonEN,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+
+      return { correct: isCorrect, coinsAwarded: reward };
+    });
+
+    let weeklyBonus = null;
+    if (question.type === 'weekly' && correct) {
+      try {
+        weeklyBonus = await maybeAwardWeeklyBonus(uid, question.scheduledDate);
+      } catch (e) {
+        console.error('weekly bonus error:', e);
+      }
+    }
+
+    res.status(200).json({ correct, coinsAwarded, weeklyBonus, correctIndex: answerData.correctIndex });
+  } catch (e) {
+    res.status(e.status || 500).json({ error: e.message || 'server-error' });
+  }
+};
+
+async function maybeAwardWeeklyBonus(uid, dateStr) {
+  const weekStart = weekStartOf(dateStr);
+  const claimRef = db.collection('weekly_challenge_claims').doc(`${uid}_${weekStart}`);
+  const already = await claimRef.get();
+  if (already.exists) return null;
+
+  const settingsSnap = await db.collection('settings').doc('weeklyChallenge').get();
+  const settings = { enabled: true, bonusCoins: 100, ...(settingsSnap.exists ? settingsSnap.data() : {}) };
+  if (!settings.enabled) return null;
+
+  const allSnap = await db.collection('daily_challenges').where('type', '==', 'weekly').get();
+  const weekQs = allSnap.docs
+    .map(d => ({ id: d.id, ...d.data() }))
+    .filter(q => weekStartOf(q.scheduledDate) === weekStart);
+  if (!weekQs.length) return null;
+
+  const attempts = await Promise.all(
+    weekQs.map(q => db.collection('daily_challenge_attempts').doc(`${uid}_${q.id}`).get())
+  );
+  const allCorrect = attempts.every(a => a.exists && a.data().correct);
+  if (!allCorrect) return null;
+
+  const userRef = db.collection('users').doc(uid);
+  const userSnap = await userRef.get();
+  const bonus = Math.round((settings.bonusCoins || 0) * activeBoostMultiplier(userSnap.data() || {}));
+
+  if (bonus > 0) {
+    await userRef.update({
+      coins: admin.firestore.FieldValue.increment(bonus),
+      coinsEarnedTotal: admin.firestore.FieldValue.increment(bonus),
+    });
+    await db.collection('coin_transactions').add({
+      userId: uid, type: 'earn', amount: bonus,
+      reasonAR: 'مكافأة إكمال التحدي الأسبوعي', reasonEN: 'Weekly challenge completion bonus',
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+  }
+  await claimRef.set({
+    userId: uid, weekStartDate: weekStart, coinsAwarded: bonus,
+    claimedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  return { coinsAwarded: bonus };
+}
